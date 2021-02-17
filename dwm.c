@@ -226,7 +226,7 @@ static void unfocus(Client *c, int setfocus);
 static void unmanage(Client *c, int destroyed);
 static void unmapnotify(XEvent *e);
 static void updatebarpos(Monitor *m);
-static void updatebars(void);
+/* static void updatebars(void); */
 static void updateclientlist(void);
 static int updategeom(void);
 static void updatenumlockmask(void);
@@ -574,12 +574,13 @@ configurenotify(XEvent *e)
 		sh = ev->height;
 		if (updategeom() || dirty) {
 			drw_resize(drw, sw, bh);
-			updatebars();
+			/* updatebars(); */
 			for (m = mons; m; m = m->next) {
 				for (c = m->clients; c; c = c->next)
 					if (c->isfullscreen)
 						resizeclient(c, m->mx, m->my, m->mw, m->mh);
-				XMoveResizeWindow(dpy, m->barwin, m->wx, m->by, m->ww, bh);
+                /* Hide status bar */
+				/* XMoveResizeWindow(dpy, m->barwin, m->wx, m->by, m->ww, bh); */
 			}
 			XMoveResizeWindow(dpy, eb.win, mons->wx, eb.y, mons->ww, bh);
 			focus(NULL);
@@ -1588,7 +1589,7 @@ setup(void)
 	for (i = 0; i < LENGTH(colors); i++)
 		scheme[i] = drw_scm_create(drw, colors[i], 3);
 	/* init bars */
-	updatebars();
+	/* updatebars(); */
 	updatestatus();
 	/* supporting window for NetWMCheck */
 	wmcheckwin = XCreateSimpleWindow(dpy, root, 0, 0, 1, 1, 0, 0, 0);
@@ -1720,7 +1721,8 @@ togglebar(const Arg *arg)
 {
 	selmon->showbar = !selmon->showbar;
 	updatebarpos(selmon);
-	XMoveResizeWindow(dpy, selmon->barwin, selmon->wx, selmon->by, selmon->ww, bh);
+    /* Hide status bar */
+	/* XMoveResizeWindow(dpy, selmon->barwin, selmon->wx, selmon->by, selmon->ww, bh); */
 	arrange(selmon);
 }
 
@@ -1828,34 +1830,34 @@ unmapnotify(XEvent *e)
 	}
 }
 
-void
-updatebars(void)
-{
-	Monitor *m;
-	XSetWindowAttributes wa = {
-		.override_redirect = True,
-		.background_pixmap = ParentRelative,
-		.event_mask = ButtonPressMask|ExposureMask
-	};
-	XClassHint ch = {"dwm", "dwm"};
-	for (m = mons; m; m = m->next) {
-		if (m->barwin)
-			continue;
-		m->barwin = XCreateWindow(dpy, root, m->wx, m->by, m->ww, bh, 0, DefaultDepth(dpy, screen),
-				CopyFromParent, DefaultVisual(dpy, screen),
-				CWOverrideRedirect|CWBackPixmap|CWEventMask, &wa);
-		XDefineCursor(dpy, m->barwin, cursor[CurNormal]->cursor);
-		XMapRaised(dpy, m->barwin);
-		XSetClassHint(dpy, m->barwin, &ch);
-	}
-	if(!eb.win) {
-		eb.win = XCreateWindow(dpy, root, mons->wx, eb.y, mons->ww, bh, 0, DefaultDepth(dpy, screen),
-				       CopyFromParent, DefaultVisual(dpy, screen),
-				       CWOverrideRedirect|CWBackPixmap|CWEventMask, &wa);
-		XDefineCursor(dpy, eb.win, cursor[CurNormal]->cursor);
-		XMapRaised(dpy, eb.win);
-	}
-}
+/* void */
+/* updatebars(void) */
+/* { */
+/* 	Monitor *m; */
+/* 	XSetWindowAttributes wa = { */
+/* 		.override_redirect = True, */
+/* 		.background_pixmap = ParentRelative, */
+/* 		.event_mask = ButtonPressMask|ExposureMask */
+/* 	}; */
+/* 	XClassHint ch = {"dwm", "dwm"}; */
+/* 	for (m = mons; m; m = m->next) { */
+/* 		if (m->barwin) */
+/* 			continue; */
+/* 		m->barwin = XCreateWindow(dpy, root, m->wx, m->by, m->ww, bh, 0, DefaultDepth(dpy, screen), */
+/* 				CopyFromParent, DefaultVisual(dpy, screen), */
+/* 				CWOverrideRedirect|CWBackPixmap|CWEventMask, &wa); */
+/* 		XDefineCursor(dpy, m->barwin, cursor[CurNormal]->cursor); */
+/* 		XMapRaised(dpy, m->barwin); */
+/* 		XSetClassHint(dpy, m->barwin, &ch); */
+/* 	} */
+/* 	if(!eb.win) { */
+/* 		eb.win = XCreateWindow(dpy, root, mons->wx, eb.y, mons->ww, bh, 0, DefaultDepth(dpy, screen), */
+/* 				       CopyFromParent, DefaultVisual(dpy, screen), */
+/* 				       CWOverrideRedirect|CWBackPixmap|CWEventMask, &wa); */
+/* 		XDefineCursor(dpy, eb.win, cursor[CurNormal]->cursor); */
+/* 		XMapRaised(dpy, eb.win); */
+/* 	} */
+/* } */
 
 void
 updatebarpos(Monitor *m)
