@@ -2027,8 +2027,8 @@ toggleview(const Arg *arg)
 		selmon->lt[selmon->sellt] = selmon->pertag->ltidxs[selmon->pertag->curtag][selmon->sellt];
 		selmon->lt[selmon->sellt^1] = selmon->pertag->ltidxs[selmon->pertag->curtag][selmon->sellt^1];
 
-		if (selmon->showbar != selmon->pertag->showbars[selmon->pertag->curtag])
-			togglebar(NULL);
+		/* if (selmon->showbar != selmon->pertag->showbars[selmon->pertag->curtag]) */
+		/* 	togglebar(NULL); */
 
 		focus(NULL);
 		arrange(selmon);
@@ -2360,8 +2360,8 @@ view(const Arg *arg)
 	selmon->lt[selmon->sellt] = selmon->pertag->ltidxs[selmon->pertag->curtag][selmon->sellt];
 	selmon->lt[selmon->sellt^1] = selmon->pertag->ltidxs[selmon->pertag->curtag][selmon->sellt^1];
 
-	if (selmon->showbar != selmon->pertag->showbars[selmon->pertag->curtag])
-		togglebar(NULL);
+	/* if (selmon->showbar != selmon->pertag->showbars[selmon->pertag->curtag]) */
+	/* 	togglebar(NULL); */
 
 	focus(NULL);
 	arrange(selmon);
