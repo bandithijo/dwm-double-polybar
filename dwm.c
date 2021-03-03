@@ -1786,8 +1786,8 @@ togglecanfocusfloating(const Arg *arg)
 		if (!c)
 			for (c = selmon->clients; c && c->isfloating; c = c->next);
 
-    }
     focus(c);
+    }
 }
 
 void
