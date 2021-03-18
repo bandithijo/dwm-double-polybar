@@ -30,6 +30,7 @@
 #include <unistd.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <sys/epoll.h>
 #include <X11/cursorfont.h>
 #include <X11/keysym.h>
 #include <X11/Xatom.h>
@@ -67,9 +68,21 @@ enum { WMProtocols, WMDelete, WMState, WMTakeFocus, WMLast }; /* default atoms *
 enum { ClkTagBar, ClkLtSymbol, ClkStatusText, ClkWinTitle,
        ClkClientWin, ClkRootWin, ClkLast }; /* clicks */
 
+typedef struct TagState TagState;
+struct TagState {
+	int selected;
+	int occupied;
+	int urgent;
+};
+
+typedef struct ClientState ClientState;
+struct ClientState {
+	int isfixed, isfloating, isurgent, neverfocus, oldstate, isfullscreen;
+};
+
 typedef union {
-	int i;
-	unsigned int ui;
+	long i;
+	unsigned long ui;
 	float f;
 	const void *v;
 } Arg;
@@ -87,6 +100,7 @@ typedef struct Client Client;
 struct Client {
 	char name[256];
 	float mina, maxa;
+	float cfact;
 	int x, y, w, h;
 	int oldx, oldy, oldw, oldh;
 	int basew, baseh, incw, inch, maxw, maxh, minw, minh;
@@ -97,6 +111,7 @@ struct Client {
 	Client *snext;
 	Monitor *mon;
 	Window win;
+	ClientState prevstate;
 };
 
 typedef struct {
@@ -116,8 +131,10 @@ typedef struct {
 	void (*arrange)(Monitor *);
 } Layout;
 
+typedef struct Pertag Pertag;
 struct Monitor {
 	char ltsymbol[16];
+	char lastltsymbol[16];
 	float mfact;
 	int nmaster;
 	int num;
@@ -127,14 +144,18 @@ struct Monitor {
 	unsigned int seltags;
 	unsigned int sellt;
 	unsigned int tagset[2];
+	TagState tagstate;
 	int showbar;
 	int topbar;
 	Client *clients;
 	Client *sel;
+	Client *lastsel;
 	Client *stack;
 	Monitor *next;
 	Window barwin;
 	const Layout *lt[2];
+	const Layout *lastlt;
+	Pertag *pertag;
 };
 
 typedef struct {
@@ -166,6 +187,7 @@ static void destroynotify(XEvent *e);
 static void detach(Client *c);
 static void detachstack(Client *c);
 static Monitor *dirtomon(int dir);
+static void dragcfact(const Arg *arg);
 static void drawbar(Monitor *m);
 static void drawbars(void);
 static void enternotify(XEvent *e);
@@ -182,6 +204,7 @@ static long getstate(Window w);
 static int gettextprop(Window w, Atom atom, char *text, unsigned int size);
 static void grabbuttons(Client *c, int focused);
 static void grabkeys(void);
+static int handlexevent(struct epoll_event *ev);
 static void incnmaster(const Arg *arg);
 static void keypress(XEvent *e);
 static void killclient(const Arg *arg);
@@ -207,8 +230,11 @@ static void setclientstate(Client *c, long state);
 static void setfocus(Client *c);
 static void setfullscreen(Client *c, int fullscreen);
 static void setlayout(const Arg *arg);
+static void setlayoutsafe(const Arg *arg);
+static void setcfact(const Arg *arg);
 static void setmfact(const Arg *arg);
 static void setup(void);
+static void setupepoll(void);
 static void seturgent(Client *c, int urg);
 static void showhide(Client *c);
 static void sigchld(int unused);
@@ -268,16 +294,35 @@ static void (*handler[LASTEvent]) (XEvent *) = {
 	[UnmapNotify] = unmapnotify
 };
 static Atom wmatom[WMLast], netatom[NetLast];
+static int epoll_fd;
+static int dpy_fd;
 static int running = 1;
 static Cur *cursor[CurLast];
 static Clr **scheme;
 static Display *dpy;
 static Drw *drw;
-static Monitor *mons, *selmon;
+static Monitor *mons, *selmon, *lastselmon;
 static Window root, wmcheckwin;
+
+#include "ipc.h"
 
 /* configuration, allows nested code to access above variables */
 #include "config.h"
+
+#ifdef VERSION
+#include "IPCClient.c"
+#include "yajl_dumps.c"
+#include "ipc.c"
+#endif
+
+struct Pertag {
+	unsigned int curtag, prevtag; /* current and previous tag */
+	int nmasters[LENGTH(tags) + 1]; /* number of windows in master area */
+	float mfacts[LENGTH(tags) + 1]; /* mfacts per tag */
+	unsigned int sellts[LENGTH(tags) + 1]; /* selected layouts */
+	const Layout *ltidxs[LENGTH(tags) + 1][2]; /* matrix of tags and layouts indexes  */
+	int showbars[LENGTH(tags) + 1]; /* display bar for the current tag */
+};
 
 /* compile-time check if all tags fit into an unsigned int bit array. */
 struct NumTags { char limitexceeded[LENGTH(tags) > 31 ? -1 : 1]; };
@@ -499,6 +544,12 @@ cleanup(void)
 	XSync(dpy, False);
 	XSetInputFocus(dpy, PointerRoot, RevertToPointerRoot, CurrentTime);
 	XDeleteProperty(dpy, root, netatom[NetActiveWindow]);
+
+	ipc_cleanup();
+
+	if (close(epoll_fd) < 0) {
+			fprintf(stderr, "Failed to close epoll file descriptor\n");
+	}
 }
 
 void
@@ -639,6 +690,7 @@ Monitor *
 createmon(void)
 {
 	Monitor *m;
+	unsigned int i;
 
 	m = ecalloc(1, sizeof(Monitor));
 	m->tagset[0] = m->tagset[1] = 1;
@@ -649,6 +701,20 @@ createmon(void)
 	m->lt[0] = &layouts[0];
 	m->lt[1] = &layouts[1 % LENGTH(layouts)];
 	strncpy(m->ltsymbol, layouts[0].symbol, sizeof m->ltsymbol);
+	m->pertag = ecalloc(1, sizeof(Pertag));
+	m->pertag->curtag = m->pertag->prevtag = 1;
+
+	for (i = 0; i <= LENGTH(tags); i++) {
+		m->pertag->nmasters[i] = m->nmaster;
+		m->pertag->mfacts[i] = m->mfact;
+
+		m->pertag->ltidxs[i][0] = m->lt[0];
+		m->pertag->ltidxs[i][1] = m->lt[1];
+		m->pertag->sellts[i] = m->sellt;
+
+		m->pertag->showbars[i] = m->showbar;
+	}
+
 	return m;
 }
 
@@ -698,6 +764,81 @@ dirtomon(int dir)
 	else
 		for (m = mons; m->next != selmon; m = m->next);
 	return m;
+}
+
+void
+dragcfact(const Arg *arg)
+{
+	int prev_x, prev_y, dist_x, dist_y;
+	float fact;
+	Client *c;
+	XEvent ev;
+	Time lasttime = 0;
+
+	if (!(c = selmon->sel))
+		return;
+	if (c->isfloating) {
+		resizemouse(arg);
+		return;
+	}
+	#if !FAKEFULLSCREEN_PATCH
+	#if FAKEFULLSCREEN_CLIENT_PATCH
+	if (c->isfullscreen && !c->fakefullscreen) /* no support resizing fullscreen windows by mouse */
+		return;
+	#else
+	if (c->isfullscreen) /* no support resizing fullscreen windows by mouse */
+		return;
+	#endif // FAKEFULLSCREEN_CLIENT_PATCH
+	#endif // !FAKEFULLSCREEN_PATCH
+	restack(selmon);
+
+	if (XGrabPointer(dpy, root, False, MOUSEMASK, GrabModeAsync, GrabModeAsync,
+		None, cursor[CurResize]->cursor, CurrentTime) != GrabSuccess)
+		return;
+	XWarpPointer(dpy, None, c->win, 0, 0, 0, 0, c->w/2, c->h/2);
+
+	prev_x = prev_y = -999999;
+
+	do {
+		XMaskEvent(dpy, MOUSEMASK|ExposureMask|SubstructureRedirectMask, &ev);
+		switch(ev.type) {
+		case ConfigureRequest:
+		case Expose:
+		case MapRequest:
+			handler[ev.type](&ev);
+			break;
+		case MotionNotify:
+			if ((ev.xmotion.time - lasttime) <= (1000 / 60))
+				continue;
+			lasttime = ev.xmotion.time;
+			if (prev_x == -999999) {
+				prev_x = ev.xmotion.x_root;
+				prev_y = ev.xmotion.y_root;
+			}
+
+			dist_x = ev.xmotion.x - prev_x;
+			dist_y = ev.xmotion.y - prev_y;
+
+			if (abs(dist_x) > abs(dist_y)) {
+				fact = (float) 4.0 * dist_x / c->mon->ww;
+			} else {
+				fact = (float) -4.0 * dist_y / c->mon->wh;
+			}
+
+			if (fact)
+				setcfact(&((Arg) { .f = fact }));
+
+			prev_x = ev.xmotion.x;
+			prev_y = ev.xmotion.y;
+			break;
+		}
+	} while (ev.type != ButtonRelease);
+
+
+	XWarpPointer(dpy, None, c->win, 0, 0, 0, 0, c->w/2, c->h/2);
+
+	XUngrabPointer(dpy, CurrentTime);
+	while (XCheckMaskEvent(dpy, EnterWindowMask, &ev));
 }
 
 void
@@ -981,10 +1122,29 @@ grabkeys(void)
 	}
 }
 
+int
+handlexevent(struct epoll_event *ev)
+{
+	if (ev->events & EPOLLIN) {
+		XEvent ev;
+		while (running && XPending(dpy)) {
+			XNextEvent(dpy, &ev);
+			if (handler[ev.type]) {
+				handler[ev.type](&ev); /* call handler */
+				ipc_send_events(mons, &lastselmon, selmon);
+			}
+		}
+	} else if (ev-> events & EPOLLHUP) {
+		return -1;
+	}
+
+	return 0;
+}
+
 void
 incnmaster(const Arg *arg)
 {
-	selmon->nmaster = MAX(selmon->nmaster + arg->i, 0);
+	selmon->nmaster = selmon->pertag->nmasters[selmon->pertag->curtag] = MAX(selmon->nmaster + arg->i, 0);
 	arrange(selmon);
 }
 
@@ -1090,6 +1250,7 @@ manage(Window w, XWindowAttributes *wa)
 	c->w = c->oldw = wa->width;
 	c->h = c->oldh = wa->height;
 	c->oldbw = wa->border_width;
+	c->cfact = 1.0;
 
 	updatetitle(c);
 	if (XGetTransientForHint(dpy, w, &trans) && (t = wintoclient(trans))) {
@@ -1426,12 +1587,40 @@ restack(Monitor *m)
 void
 run(void)
 {
-	XEvent ev;
-	/* main event loop */
+	int event_count = 0;
+	const int MAX_EVENTS = 10;
+	struct epoll_event events[MAX_EVENTS];
+
 	XSync(dpy, False);
-	while (running && !XNextEvent(dpy, &ev))
-		if (handler[ev.type])
-			handler[ev.type](&ev); /* call handler */
+
+	/* main event loop */
+	while (running) {
+		event_count = epoll_wait(epoll_fd, events, MAX_EVENTS, -1);
+
+		for (int i = 0; i < event_count; i++) {
+			int event_fd = events[i].data.fd;
+			DEBUG("Got event from fd %d\n", event_fd);
+
+			if (event_fd == dpy_fd) {
+				// -1 means EPOLLHUP
+				if (handlexevent(events + i) == -1)
+					return;
+			} else if (event_fd == ipc_get_sock_fd()) {
+				ipc_handle_socket_epoll_event(events + i);
+			} else if (ipc_is_client_registered(event_fd)){
+				if (ipc_handle_client_epoll_event(events + i, mons, &lastselmon, selmon,
+							tags, LENGTH(tags), layouts, LENGTH(layouts)) < 0) {
+					fprintf(stderr, "Error handling IPC event on fd %d\n", event_fd);
+				}
+			} else {
+				fprintf(stderr, "Got event from unknown fd %d, ptr %p, u32 %d, u64 %lu",
+						event_fd, events[i].data.ptr, events[i].data.u32,
+						events[i].data.u64);
+				fprintf(stderr, " with events %d\n", events[i].events);
+				return;
+			}
+		}
+	}
 }
 
 void
@@ -1555,14 +1744,50 @@ void
 setlayout(const Arg *arg)
 {
 	if (!arg || !arg->v || arg->v != selmon->lt[selmon->sellt])
-		selmon->sellt ^= 1;
+		selmon->sellt = selmon->pertag->sellts[selmon->pertag->curtag] ^= 1;
 	if (arg && arg->v)
-		selmon->lt[selmon->sellt] = (Layout *)arg->v;
+		selmon->lt[selmon->sellt] = selmon->pertag->ltidxs[selmon->pertag->curtag][selmon->sellt] = (Layout *)arg->v;
 	strncpy(selmon->ltsymbol, selmon->lt[selmon->sellt]->symbol, sizeof selmon->ltsymbol);
 	if (selmon->sel)
 		arrange(selmon);
 	else
 		drawbar(selmon);
+}
+
+void
+setlayoutsafe(const Arg *arg)
+{
+	const Layout *ltptr = (Layout *)arg->v;
+	if (ltptr == 0)
+			setlayout(arg);
+	for (int i = 0; i < LENGTH(layouts); i++) {
+		if (ltptr == &layouts[i])
+			setlayout(arg);
+	}
+}
+
+void
+setcfact(const Arg *arg)
+{
+	float f;
+	Client *c;
+
+	c = selmon->sel;
+
+	if (!arg || !c || !selmon->lt[selmon->sellt]->arrange)
+		return;
+	if (!arg->f)
+		f = 1.0;
+	else if (arg->f > 4.0) // set fact absolutely
+		f = arg->f - 4.0;
+	else
+		f = arg->f + c->cfact;
+	if (f < 0.25)
+		f = 0.25;
+	else if (f > 4.0)
+		f = 4.0;
+	c->cfact = f;
+	arrange(selmon);
 }
 
 /* arg > 1.0 will set mfact absolutely */
@@ -1576,7 +1801,7 @@ setmfact(const Arg *arg)
 	f = arg->f < 1.0 ? arg->f + selmon->mfact : arg->f - 1.0;
 	if (f < 0.05 || f > 0.95)
 		return;
-	selmon->mfact = f;
+	selmon->mfact = selmon->pertag->mfacts[selmon->pertag->curtag] = f;
 	arrange(selmon);
 }
 
@@ -1648,8 +1873,37 @@ setup(void)
 	XSelectInput(dpy, root, wa.event_mask);
 	grabkeys();
 	focus(NULL);
+	setupepoll();
 }
 
+void
+setupepoll(void)
+{
+	epoll_fd = epoll_create1(0);
+	dpy_fd = ConnectionNumber(dpy);
+	struct epoll_event dpy_event;
+
+	// Initialize struct to 0
+	memset(&dpy_event, 0, sizeof(dpy_event));
+
+	DEBUG("Display socket is fd %d\n", dpy_fd);
+
+	if (epoll_fd == -1) {
+		fputs("Failed to create epoll file descriptor", stderr);
+	}
+
+	dpy_event.events = EPOLLIN;
+	dpy_event.data.fd = dpy_fd;
+	if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, dpy_fd, &dpy_event)) {
+		fputs("Failed to add display file descriptor to epoll", stderr);
+		close(epoll_fd);
+		exit(1);
+	}
+
+	if (ipc_init(ipcsockpath, epoll_fd, ipccommands, LENGTH(ipccommands)) < 0) {
+		fputs("Failed to initialize IPC\n", stderr);
+	}
+}
 
 void
 seturgent(Client *c, int urg)
@@ -1728,9 +1982,15 @@ void
 tile(Monitor *m)
 {
 	unsigned int i, n, h, mw, my, ty;
+	float mfacts = 0, sfacts = 0;
 	Client *c;
 
-	for (n = 0, c = nexttiled(m->clients); c; c = nexttiled(c->next), n++);
+	for (n = 0, c = nexttiled(m->clients); c; c = nexttiled(c->next), n++) {
+		if (n < m->nmaster)
+			mfacts += c->cfact;
+		else
+			sfacts += c->cfact;
+	}
 	if (n == 0)
 		return;
 
@@ -1740,22 +2000,24 @@ tile(Monitor *m)
 		mw = m->ww;
 	for (i = my = ty = 0, c = nexttiled(m->clients); c; c = nexttiled(c->next), i++)
 		if (i < m->nmaster) {
-			h = (m->wh - my) / (MIN(n, m->nmaster) - i);
+			h = (m->wh - my) * (c->cfact / mfacts);
 			resize(c, m->wx, m->wy + my, mw - (2*c->bw), h - (2*c->bw), 0);
 			if (my + HEIGHT(c) < m->wh)
 				my += HEIGHT(c);
+			mfacts -= c->cfact;
 		} else {
 			h = (m->wh - ty) / (n - i);
 			resize(c, m->wx + mw, m->wy + ty, m->ww - mw - (2*c->bw), h - (2*c->bw), 0);
 			if (ty + HEIGHT(c) < m->wh)
 				ty += HEIGHT(c);
+			sfacts -= c->cfact;
 		}
 }
 
 void
 togglebar(const Arg *arg)
 {
-	selmon->showbar = !selmon->showbar;
+	selmon->showbar = selmon->pertag->showbars[selmon->pertag->curtag] = !selmon->showbar;
 	updatebarpos(selmon);
 	XMoveResizeWindow(dpy, selmon->barwin, selmon->wx, selmon->by, selmon->ww, bh);
 	arrange(selmon);
@@ -1794,9 +2056,33 @@ void
 toggleview(const Arg *arg)
 {
 	unsigned int newtagset = selmon->tagset[selmon->seltags] ^ (arg->ui & TAGMASK);
+	int i;
 
 	if (newtagset) {
 		selmon->tagset[selmon->seltags] = newtagset;
+
+		if (newtagset == ~0) {
+			selmon->pertag->prevtag = selmon->pertag->curtag;
+			selmon->pertag->curtag = 0;
+		}
+
+		/* test if the user did not select the same tag */
+		if (!(newtagset & 1 << (selmon->pertag->curtag - 1))) {
+			selmon->pertag->prevtag = selmon->pertag->curtag;
+			for (i = 0; !(newtagset & 1 << i); i++) ;
+			selmon->pertag->curtag = i + 1;
+		}
+
+		/* apply settings for this view */
+		selmon->nmaster = selmon->pertag->nmasters[selmon->pertag->curtag];
+		selmon->mfact = selmon->pertag->mfacts[selmon->pertag->curtag];
+		selmon->sellt = selmon->pertag->sellts[selmon->pertag->curtag];
+		selmon->lt[selmon->sellt] = selmon->pertag->ltidxs[selmon->pertag->curtag][selmon->sellt];
+		selmon->lt[selmon->sellt^1] = selmon->pertag->ltidxs[selmon->pertag->curtag][selmon->sellt^1];
+
+		/* if (selmon->showbar != selmon->pertag->showbars[selmon->pertag->curtag]) */
+		/* 	togglebar(NULL); */
+
 		focus(NULL);
 		arrange(selmon);
 	}
@@ -2051,10 +2337,18 @@ updatestatus(void)
 void
 updatetitle(Client *c)
 {
+	char oldname[sizeof(c->name)];
+	strcpy(oldname, c->name);
+
 	if (!gettextprop(c->win, netatom[NetWMName], c->name, sizeof c->name))
 		gettextprop(c->win, XA_WM_NAME, c->name, sizeof c->name);
 	if (c->name[0] == '\0') /* hack to mark broken clients */
 		strcpy(c->name, broken);
+
+	for (Monitor *m = mons; m; m = m->next) {
+		if (m->sel == c && strcmp(oldname, c->name) != 0)
+			ipc_focused_title_change_event(m->num, c->win, oldname, c->name);
+	}
 }
 
 void
@@ -2091,11 +2385,37 @@ updatewmhints(Client *c)
 void
 view(const Arg *arg)
 {
+	int i;
+	unsigned int tmptag;
+
 	if ((arg->ui & TAGMASK) == selmon->tagset[selmon->seltags])
 		return;
 	selmon->seltags ^= 1; /* toggle sel tagset */
-	if (arg->ui & TAGMASK)
+	if (arg->ui & TAGMASK) {
 		selmon->tagset[selmon->seltags] = arg->ui & TAGMASK;
+		selmon->pertag->prevtag = selmon->pertag->curtag;
+
+		if (arg->ui == ~0)
+			selmon->pertag->curtag = 0;
+		else {
+			for (i = 0; !(arg->ui & 1 << i); i++) ;
+			selmon->pertag->curtag = i + 1;
+		}
+	} else {
+		tmptag = selmon->pertag->prevtag;
+		selmon->pertag->prevtag = selmon->pertag->curtag;
+		selmon->pertag->curtag = tmptag;
+	}
+
+	selmon->nmaster = selmon->pertag->nmasters[selmon->pertag->curtag];
+	selmon->mfact = selmon->pertag->mfacts[selmon->pertag->curtag];
+	selmon->sellt = selmon->pertag->sellts[selmon->pertag->curtag];
+	selmon->lt[selmon->sellt] = selmon->pertag->ltidxs[selmon->pertag->curtag][selmon->sellt];
+	selmon->lt[selmon->sellt^1] = selmon->pertag->ltidxs[selmon->pertag->curtag][selmon->sellt^1];
+
+	/* if (selmon->showbar != selmon->pertag->showbars[selmon->pertag->curtag]) */
+	/* 	togglebar(NULL); */
+
 	focus(NULL);
 	arrange(selmon);
 }
